@@ -42,6 +42,10 @@
 #include "blk.h"
 #include "blk-mq-sched.h"
 #include "blk-wbt.h"
+#if defined(OPLUS_FEATURE_UIFIRST) && defined(CONFIG_OPLUS_FEATURE_UXIO_FIRST)
+/*Huacai.Zhou@BSP.Kernel.IO, 2020-06-12,add ux io first opt*/
+#include "oppo_uxio_first/oppo_uxio_first_opt.h"
+#endif
 
 static DEFINE_SPINLOCK(elv_list_lock);
 static LIST_HEAD(elv_list);
@@ -394,6 +398,10 @@ void elv_dispatch_sort(struct request_queue *q, struct request *rq)
 	}
 
 	list_add(&rq->queuelist, entry);
+#if defined(OPLUS_FEATURE_UIFIRST) && defined(CONFIG_OPLUS_FEATURE_UXIO_FIRST)
+/*Huacai.Zhou@BSP.Kernel.IO, 2020-06-12,add ux io first opt*/
+	queue_throtl_add_request(q, rq, false);
+#endif
 }
 EXPORT_SYMBOL(elv_dispatch_sort);
 
@@ -414,6 +422,10 @@ void elv_dispatch_add_tail(struct request_queue *q, struct request *rq)
 	q->end_sector = rq_end_sector(rq);
 	q->boundary_rq = rq;
 	list_add_tail(&rq->queuelist, &q->queue_head);
+#if defined(OPLUS_FEATURE_UIFIRST) && defined(CONFIG_OPLUS_FEATURE_UXIO_FIRST)
+/*Huacai.Zhou@BSP.Kernel.IO, 2020-06-12,add ux io first opt*/
+	queue_throtl_add_request(q, rq, false);
+#endif
 }
 EXPORT_SYMBOL(elv_dispatch_add_tail);
 
@@ -586,6 +598,13 @@ void elv_requeue_request(struct request_queue *q, struct request *rq)
 	 */
 	if (blk_account_rq(rq)) {
 		q->in_flight[rq_is_sync(rq)]--;
+#ifdef OPLUS_FEATURE_HEALTHINFO
+// jiheng.xie@PSW.Tech.BSP.Performance, 2019/03/11
+// Add for ioqueue
+#ifdef CONFIG_OPPO_HEALTHINFO
+		ohm_ioqueue_dec_inflight(q, rq);
+#endif
+#endif /* OPLUS_FEATURE_HEALTHINFO */
 		if (rq->rq_flags & RQF_SORTED)
 			elv_deactivate_rq(q, rq);
 	}
@@ -618,6 +637,11 @@ void elv_drain_elevator(struct request_queue *q)
 
 void __elv_add_request(struct request_queue *q, struct request *rq, int where)
 {
+/* chenweijian@TECH.Storage.IOMonitor, add for statistical IO time-consuming distribution, 2020/02/18 */
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_IOMONITOR)
+	rq->req_ti = ktime_get();
+#endif /*VENDOR_EDIT*/
+
 	trace_block_rq_insert(q, rq);
 
 	blk_pm_add_request(q, rq);
@@ -640,12 +664,20 @@ void __elv_add_request(struct request_queue *q, struct request *rq, int where)
 	case ELEVATOR_INSERT_FRONT:
 		rq->rq_flags |= RQF_SOFTBARRIER;
 		list_add(&rq->queuelist, &q->queue_head);
+#if defined(OPLUS_FEATURE_UIFIRST) && defined(CONFIG_OPLUS_FEATURE_UXIO_FIRST)
+/*Huacai.Zhou@BSP.Kernel.IO, 2020-06-12,add ux io first opt*/
+		queue_throtl_add_request(q, rq, true);
+#endif
 		break;
 
 	case ELEVATOR_INSERT_BACK:
 		rq->rq_flags |= RQF_SOFTBARRIER;
 		elv_drain_elevator(q);
 		list_add_tail(&rq->queuelist, &q->queue_head);
+#if defined(OPLUS_FEATURE_UIFIRST) && defined(CONFIG_OPLUS_FEATURE_UXIO_FIRST)
+/*Huacai.Zhou@BSP.Kernel.IO, 2020-06-12,add ux io first opt*/
+		queue_throtl_add_request(q, rq, false);
+#endif
 		/*
 		 * We kick the queue here for the following reasons.
 		 * - The elevator might have returned NULL previously
@@ -780,6 +812,13 @@ void elv_completed_request(struct request_queue *q, struct request *rq)
 	 */
 	if (blk_account_rq(rq)) {
 		q->in_flight[rq_is_sync(rq)]--;
+#ifdef OPLUS_FEATURE_HEALTHINFO
+// jiheng.xie@PSW.Tech.BSP.Performance, 2019/03/11
+// Add for ioqueue
+#ifdef CONFIG_OPPO_HEALTHINFO
+		ohm_ioqueue_dec_inflight(q, rq);
+#endif
+#endif /* OPLUS_FEATURE_HEALTHINFO */
 		if ((rq->rq_flags & RQF_SORTED) &&
 		    e->type->ops.sq.elevator_completed_req_fn)
 			e->type->ops.sq.elevator_completed_req_fn(q, rq);
