@@ -307,9 +307,9 @@ void kgsl_process_init_sysfs(struct kgsl_device *device,
 	kgsl_process_private_get(private);
 
 	if (kobject_init_and_add(&private->kobj, &process_ktype,
-		kgsl_driver.prockobj, "%d", private->pid)) {
+		kgsl_driver.prockobj, "%d", pid_nr(private->pid))) {
 		dev_err(device->dev, "Unable to add sysfs for process %d\n",
-			private->pid);
+			pid_nr(private->pid));
 		return;
 	}
 
@@ -324,7 +324,7 @@ void kgsl_process_init_sysfs(struct kgsl_device *device,
 		if (ret)
 			dev_err(device->dev,
 				"Unable to create sysfs files for process %d\n",
-				private->pid);
+				pid_nr(private->pid));
 	}
 
 	for (i = 0; i < ARRAY_SIZE(debug_memstats); i++) {
@@ -336,6 +336,14 @@ void kgsl_process_init_sysfs(struct kgsl_device *device,
 
 	kgsl_reclaim_proc_sysfs_init(private);
 }
+
+#ifdef OPLUS_FEATURE_HEALTHINFO
+//Jiheng.Xie@TECH.BSP.Performance, 2019-07-22, add for  gpu total used account
+unsigned long gpu_total(void)
+{
+	return (unsigned long)atomic_long_read(&kgsl_driver.stats.page_alloc);
+}
+#endif /* OPLUS_FEATURE_HEALTHINFO */
 
 static ssize_t memstat_show(struct device *dev,
 			 struct device_attribute *attr, char *buf)
@@ -520,8 +528,6 @@ static int kgsl_page_alloc_vmfault(struct kgsl_memdesc *memdesc,
 
 	vmf->page = memdesc->pages[pgoff];
 
-	atomic_long_add(PAGE_SIZE, &memdesc->mapsize);
-
 	return 0;
 }
 
@@ -693,8 +699,6 @@ static int kgsl_contiguous_vmfault(struct kgsl_memdesc *memdesc,
 		return VM_FAULT_OOM;
 	else if (ret == -EFAULT)
 		return VM_FAULT_SIGBUS;
-
-	atomic_long_add(PAGE_SIZE, &memdesc->mapsize);
 
 	return VM_FAULT_NOPAGE;
 }
