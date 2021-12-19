@@ -73,6 +73,12 @@
 
 #include "locking/rtmutex_common.h"
 
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+#include <linux/oppo_uifirst_decouple/oppo_cfs_futex.h>
+#include <linux/oppo_uifirst_decouple/oppo_cfs_common.h>
+#endif /* OPLUS_FEATURE_UIFIRST */
+
 /*
  * READ this before attempting to hack on futexes!
  *
@@ -243,6 +249,11 @@ struct futex_q {
 	struct plist_node list;
 
 	struct task_struct *task;
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+	struct task_struct *wait_for;
+	atomic_t ux_waitings;
+#endif /* OPLUS_FEATURE_UIFIRST */
 	spinlock_t *lock_ptr;
 	union futex_key key;
 	struct futex_pi_state *pi_state;
@@ -418,6 +429,47 @@ static inline int match_futex(union futex_key *key1, union futex_key *key2)
 }
 
 /*
+* Generate a machine wide unique identifier for this inode.
+*
+* This relies on u64 not wrapping in the life-time of the machine; which with
+* 1ns resolution means almost 585 years.
+*
+* This further relies on the fact that a well formed program will not unmap
+* the file while it has a (shared) futex waiting on it. This mapping will have
+* a file reference which pins the mount and inode.
+*
+* If for some reason an inode gets evicted and read back in again, it will get
+* a new sequence number and will _NOT_ match, even though it is the exact same
+* file.
+*
+* It is important that match_futex() will never have a false-positive, esp.
+* for PI futexes that can mess up the state. The above argues that false-negatives
+* are only possible for malformed programs.
+*/
+static u64 get_inode_sequence_number(struct inode *inode)
+{
+	static atomic64_t i_seq;
+	u64 old;
+
+	/* Does the inode already have a sequence number? */
+	old = atomic64_read(&inode->i_sequence);
+	if (likely(old))
+		return old;
+
+	for (;;) {
+		u64 new = atomic64_add_return(1, &i_seq);
+		if (WARN_ON_ONCE(!new))
+			continue;
+
+		old = atomic64_cmpxchg_relaxed(&inode->i_sequence, 0, new);
+		if (old)
+			return old;
+		return new;
+	}
+}
+
+
+/*
  * Take a reference to the resource addressed by a key.
  * Can be called while holding spinlocks.
  *
@@ -439,7 +491,7 @@ static void get_futex_key_refs(union futex_key *key)
 
 	switch (key->both.offset & (FUT_OFF_INODE|FUT_OFF_MMSHARED)) {
 	case FUT_OFF_INODE:
-		ihold(key->shared.inode); /* implies smp_mb(); (B) */
+		smp_mb();		/* explicit smp_mb(); (B) */
 		break;
 	case FUT_OFF_MMSHARED:
 		futex_get_mm(key); /* implies smp_mb(); (B) */
@@ -473,7 +525,6 @@ static void drop_futex_key_refs(union futex_key *key)
 
 	switch (key->both.offset & (FUT_OFF_INODE|FUT_OFF_MMSHARED)) {
 	case FUT_OFF_INODE:
-		iput(key->shared.inode);
 		break;
 	case FUT_OFF_MMSHARED:
 		mmdrop(key->private.mm);
@@ -635,7 +686,7 @@ again:
 		key->private.mm = mm;
 		key->private.address = address;
 
-		get_futex_key_refs(key); /* implies smp_mb(); (B) */
+
 
 	} else {
 		struct inode *inode;
@@ -668,39 +719,14 @@ again:
 			goto again;
 		}
 
-		/*
-		 * Take a reference unless it is about to be freed. Previously
-		 * this reference was taken by ihold under the page lock
-		 * pinning the inode in place so i_lock was unnecessary. The
-		 * only way for this check to fail is if the inode was
-		 * truncated in parallel which is almost certainly an
-		 * application bug. In such a case, just retry.
-		 *
-		 * We are not calling into get_futex_key_refs() in file-backed
-		 * cases, therefore a successful atomic_inc return below will
-		 * guarantee that get_futex_key() will still imply smp_mb(); (B).
-		 */
-		if (!atomic_inc_not_zero(&inode->i_count)) {
-			rcu_read_unlock();
-			put_page(page);
-
-			goto again;
-		}
-
-		/* Should be impossible but lets be paranoid for now */
-		if (WARN_ON_ONCE(inode->i_mapping != mapping)) {
-			err = -EFAULT;
-			rcu_read_unlock();
-			iput(inode);
-
-			goto out;
-		}
 
 		key->both.offset |= FUT_OFF_INODE; /* inode-based key */
-		key->shared.inode = inode;
+		key->shared.i_seq = get_inode_sequence_number(inode);
 		key->shared.pgoff = basepage_index(tail);
 		rcu_read_unlock();
 	}
+
+	get_futex_key_refs(key); /* implies smp_mb(); (B) */
 
 out:
 	put_page(page);
@@ -1609,6 +1635,15 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 			if (!(this->bitset & bitset))
 				continue;
 
+#ifdef OPLUS_FEATURE_UIFIRST
+    // Liujie.Xie@TECH.Kernel.Sched, 2019/10/08, add for ui first
+        if (sysctl_uifirst_enabled) {
+            int ux_waitings = atomic_read(&(this->ux_waitings));
+            if (ux_waitings > 0) {
+                futex_dynamic_ux_dequeue_refs(current, ux_waitings);
+            }
+        }
+#endif /* OPLUS_FEATURE_UIFIRST */
 			mark_wake_futex(&wake_q, this);
 			if (++ret >= nr_wake)
 				break;
@@ -2245,6 +2280,12 @@ static inline void __queue_me(struct futex_q *q, struct futex_hash_bucket *hb)
 	 * the others are woken last, in FIFO order.
 	 */
 	prio = min(current->normal_prio, MAX_RT_PRIO);
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+	if (sysctl_uifirst_enabled && test_task_ux(current)) {
+		prio = min(current->normal_prio, MAX_RT_PRIO - 1);
+	}
+#endif /* OPLUS_FEATURE_UIFIRST */
 
 	plist_node_init(&q->list, prio);
 	plist_add(&q->list, &hb->chain);
@@ -2590,6 +2631,17 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 	 * access to the hash list and forcing another memory barrier.
 	 */
 	set_current_state(TASK_INTERRUPTIBLE);
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+	if (sysctl_uifirst_enabled) {
+		if (!timeout) {
+			futex_dynamic_ux_enqueue_refs(q->wait_for, current);
+			if (test_set_dynamic_ux(current)) {
+				atomic_inc(&(q->ux_waitings));
+			}
+		}
+	}
+#endif /* OPLUS_FEATURE_UIFIRST */
 	queue_me(q, hb);
 
 	/* Arm the timer */
@@ -2606,8 +2658,21 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 		 * flagged for rescheduling. Only call schedule if there
 		 * is no timeout, or if it has yet to expire.
 		 */
-		if (!timeout || timeout->task)
+		if (!timeout || timeout->task) {
+#ifdef OPLUS_FEATURE_HEALTHINFO
+// Liujie.Xie@TECH.Kernel.Sched, 2019/08/29, add for jank monitor
+#ifdef CONFIG_OPPO_JANK_INFO
+			current->in_futex = 1;
+#endif
+#endif /* OPLUS_FEATURE_HEALTHINFO */
 			freezable_schedule();
+#ifdef OPLUS_FEATURE_HEALTHINFO
+// Liujie.Xie@TECH.Kernel.Sched, 2019/08/29, add for jank monitor
+#ifdef CONFIG_OPPO_JANK_INFO
+			current->in_futex = 0;
+#endif
+#endif /* OPLUS_FEATURE_HEALTHINFO */
+		}
 	}
 	__set_current_state(TASK_RUNNING);
 }
@@ -2688,8 +2753,32 @@ out:
 	return ret;
 }
 
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+static struct task_struct* get_futex_owner_by_pid_local(u32 owner_tid) {
+	struct task_struct* futex_owner = NULL;
+
+	if (owner_tid > 0 && owner_tid <= PID_MAX_DEFAULT) {
+		rcu_read_lock();
+		futex_owner = find_task_by_vpid(owner_tid);
+		if (futex_owner) {
+			get_task_struct(futex_owner);
+		}
+		rcu_read_unlock();
+	}
+
+	return futex_owner;
+}
+#endif /* OPLUS_FEATURE_UIFIRST */
+
+#ifndef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
 static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
 		      ktime_t *abs_time, u32 bitset)
+#else /* OPLUS_FEATURE_UIFIRST */
+static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
+                ktime_t *abs_time, u32 bitset, u32 owner_tid)
+#endif /* OPLUS_FEATURE_UIFIRST */
 {
 	struct hrtimer_sleeper timeout, *to = NULL;
 	struct restart_block *restart;
@@ -2700,6 +2789,20 @@ static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
 	if (!bitset)
 		return -EINVAL;
 	q.bitset = bitset;
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+	if (sysctl_uifirst_enabled && (bitset == FUTEX_BITSET_MATCH_ANY) && test_task_ux(current)) {
+		struct task_struct* owner_task = get_futex_owner_by_pid_local(owner_tid);
+		//Kezhi.Zhu@TECH.Kernel.Sched if same process or shared lock
+		if (owner_task != NULL) {
+			if ((current->tgid == owner_task->tgid) || (flags & FLAGS_SHARED)) {
+				q.wait_for = owner_task;
+			} else {
+				put_task_struct(owner_task);
+			}
+		}
+	}
+#endif /* OPLUS_FEATURE_UIFIRST */
 
 	if (abs_time) {
 		to = &timeout;
@@ -2751,6 +2854,10 @@ retry:
 	restart->futex.time = *abs_time;
 	restart->futex.bitset = bitset;
 	restart->futex.flags = flags | FLAGS_HAS_TIMEOUT;
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+    restart->futex.uaddr2 = (u32*)(long)owner_tid;
+#endif /* OPLUS_FEATURE_UIFIRST */
 
 	ret = -ERESTART_RESTARTBLOCK;
 
@@ -2759,6 +2866,10 @@ out:
 		hrtimer_cancel(&to->timer);
 		destroy_hrtimer_on_stack(&to->timer);
 	}
+#ifdef OPLUS_FEATURE_UIFIRST
+	if (q.wait_for)
+		put_task_struct(q.wait_for);
+#endif /* OPLUS_FEATURE_UIFIRST */
 	return ret;
 }
 
@@ -2774,8 +2885,14 @@ static long futex_wait_restart(struct restart_block *restart)
 	}
 	restart->fn = do_no_restart_syscall;
 
+#ifndef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
 	return (long)futex_wait(uaddr, restart->futex.flags,
 				restart->futex.val, tp, restart->futex.bitset);
+#else /* OPLUS_FEATURE_UIFIRST */
+    return (long)futex_wait(uaddr, restart->futex.flags,
+                restart->futex.val, tp, restart->futex.bitset, (u32)(long)(restart->futex.uaddr2));
+#endif /* OPLUS_FEATURE_UIFIRST */
 }
 
 
@@ -3689,7 +3806,12 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 		val3 = FUTEX_BITSET_MATCH_ANY;
 		/* fall through */
 	case FUTEX_WAIT_BITSET:
+#ifndef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
 		return futex_wait(uaddr, flags, val, timeout, val3);
+#else /* OPLUS_FEATURE_UIFIRST */
+        return futex_wait(uaddr, flags, val, timeout, val3, (u32)(long)uaddr2);
+#endif /* OPLUS_FEATURE_UIFIRST */
 	case FUTEX_WAKE:
 		val3 = FUTEX_BITSET_MATCH_ANY;
 		/* fall through */

@@ -13,6 +13,13 @@
 #include "walt.h"
 
 #include <trace/events/sched.h>
+#ifdef OPLUS_FEATURE_UIFIRST
+// XuHaifeng@BSP.KERNEL.PERFORMANCE, 2020/08/03, Add for UIFirst(slide boost)
+#include <linux/sched.h>
+extern u64 ux_task_load[];
+extern u64 ux_load_ts[];
+#define UX_LOAD_WINDOW 8000000
+#endif /* OPLUS_FEATURE_UIFIRST */
 
 const char *task_event_names[] = {"PUT_PREV_TASK", "PICK_NEXT_TASK",
 				  "TASK_WAKE", "TASK_MIGRATE", "TASK_UPDATE",
@@ -504,7 +511,12 @@ static inline u64 freq_policy_load(struct rq *rq)
 	u64 aggr_grp_load = cluster->aggr_grp_load;
 	u64 load, tt_load = 0;
 	struct task_struct *cpu_ksoftirqd = per_cpu(ksoftirqd, cpu_of(rq));
-
+#ifdef OPLUS_FEATURE_UIFIRST
+	// XuHaifeng@BSP.KERNEL.PERFORMANCE, 2020/08/18, Add for UIFirst(slide boost)
+	u64 wallclock = sched_ktime_clock();
+	u64 timeline = 0;
+	int cpu = cpu_of(rq);
+#endif /* OPLUS_FEATURE_UIFIRST */
 	if (rq->ed_task != NULL) {
 		load = sched_ravg_window;
 		goto done;
@@ -539,6 +551,15 @@ static inline u64 freq_policy_load(struct rq *rq)
 			load = div64_u64(load * sysctl_sched_user_hint,
 					 (u64)100);
 	}
+#ifdef OPLUS_FEATURE_UIFIRST
+	// XuHaifeng@BSP.KERNEL.PERFORMANCE, 2020/08/18, Add for UIFirst(slide boost)
+	if (sysctl_uifirst_enabled && sysctl_slide_boost_enabled && ux_load_ts[cpu]) {
+		timeline = wallclock - ux_load_ts[cpu];
+		if  (timeline >= UX_LOAD_WINDOW)
+			ux_task_load[cpu] = 0;
+		load = max_t(u64, load, ux_task_load[cpu]);
+	}
+#endif /* OPLUS_FEATURE_UIFIRST */
 
 done:
 	trace_sched_load_to_gov(rq, aggr_grp_load, tt_load, sched_freq_aggr_en,
@@ -870,7 +891,24 @@ migrate_top_tasks(struct task_struct *p, struct rq *src_rq, struct rq *dst_rq)
 				src_rq->top_tasks_bitmap[src], top_index);
 	}
 }
+#ifdef OPLUS_FEATURE_EDTASK_IMPROVE
+//Tiren.Ma@ANDROID.POWER, 2020-06-24, Add for improving ed task migration
+void migrate_ed_task(struct task_struct *p, u64 wallclock,
+				struct rq *src_rq, struct rq *dest_rq)
+{
+	int src_cpu = cpu_of(src_rq);
+	int dest_cpu = cpu_of(dest_rq);
 
+	/* For ed task, reset last_wake_ts if task migrate to faster cpu */
+	if (capacity_orig_of(src_cpu) < capacity_orig_of(dest_cpu)) {
+		p->last_wake_ts = wallclock;
+		if(dest_rq->ed_task == p) {
+			dest_rq->ed_task = NULL;
+		}
+	}
+}
+extern int sysctl_ed_task_enabled;
+#endif /* OPLUS_FEATURE_EDTASK_IMPROVE */
 void fixup_busy_time(struct task_struct *p, int new_cpu)
 {
 	struct rq *src_rq = task_rq(p);
@@ -988,7 +1026,12 @@ void fixup_busy_time(struct task_struct *p, int new_cpu)
 			dest_rq->ed_task = p;
 		}
 	}
-
+#ifdef OPLUS_FEATURE_EDTASK_IMPROVE
+//Tiren.Ma@ANDROID.POWER, 2020-06-24, Add for improving ed task migration
+	if(sysctl_ed_task_enabled) {
+		migrate_ed_task(p, wallclock, src_rq, dest_rq);
+	}
+#endif /* OPLUS_FEATURE_EDTASK_IMPROVE */
 done:
 	if (p->state == TASK_WAKING)
 		double_rq_unlock(src_rq, dest_rq);
@@ -1819,6 +1862,9 @@ static void update_history(struct rq *rq, struct task_struct *p,
 	}
 
 	p->ravg.sum = 0;
+#ifdef OPLUS_FEATURE_POWER_CPUFREQ
+	sysctl_sched_window_stats_policy = schedtune_window_policy(p);
+#endif
 
 	if (sysctl_sched_window_stats_policy == WINDOW_STATS_RECENT) {
 		demand = runtime;
@@ -2648,7 +2694,6 @@ static void transfer_busy_time(struct rq *rq, struct related_thread_group *grp,
  * Enable colocation and frequency aggregation for all threads in a process.
  * The children inherits the group id from the parent.
  */
-unsigned int __read_mostly sysctl_sched_enable_thread_grouping;
 unsigned int __read_mostly sysctl_sched_coloc_downmigrate_ns;
 
 struct related_thread_group *related_thread_groups[MAX_NUM_CGROUP_COLOC_ID];
@@ -2920,34 +2965,25 @@ void add_new_task_to_grp(struct task_struct *new)
 {
 	unsigned long flags;
 	struct related_thread_group *grp;
-	struct task_struct *leader = new->group_leader;
-	unsigned int leader_grp_id = sched_get_group_id(leader);
 
-	if (!sysctl_sched_enable_thread_grouping &&
-	    leader_grp_id != DEFAULT_CGROUP_COLOC_ID)
+	/*
+	 * If the task does not belong to colocated schedtune
+	 * cgroup, nothing to do. We are checking this without
+	 * lock. Even if there is a race, it will be added
+	 * to the co-located cgroup via cgroup attach.
+	 */
+	if (!schedtune_task_colocated(new))
 		return;
 
-	if (thread_group_leader(new))
-		return;
-
-	if (leader_grp_id == DEFAULT_CGROUP_COLOC_ID) {
-		if (!same_schedtune(new, leader))
-			return;
-	}
-
+	grp = lookup_related_thread_group(DEFAULT_CGROUP_COLOC_ID);
 	write_lock_irqsave(&related_thread_group_lock, flags);
-
-	rcu_read_lock();
-	grp = task_related_thread_group(leader);
-	rcu_read_unlock();
 
 	/*
 	 * It's possible that someone already added the new task to the
-	 * group. A leader's thread group is updated prior to calling
-	 * this function. It's also possible that the leader has exited
-	 * the group. In either case, there is nothing else to do.
+	 * group. or it might have taken out from the colocated schedtune
+	 * cgroup. check these conditions under lock.
 	 */
-	if (!grp || new->grp) {
+	if (!schedtune_task_colocated(new) || new->grp) {
 		write_unlock_irqrestore(&related_thread_group_lock, flags);
 		return;
 	}

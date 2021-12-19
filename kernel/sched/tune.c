@@ -9,6 +9,9 @@
 #include <trace/events/sched.h>
 
 #include "sched.h"
+#ifdef OPLUS_FEATURE_POWER_CPUFREQ
+#include "walt.h"
+#endif
 
 bool schedtune_initialized = false;
 extern struct reciprocal_value schedtune_spc_rdiv;
@@ -113,6 +116,9 @@ struct schedtune {
 	/* Hint to bias scheduling of tasks on that SchedTune CGroup
 	 * towards idle CPUs */
 	int prefer_idle;
+#ifdef OPLUS_FEATURE_POWER_CPUFREQ
+	unsigned int window_policy;
+#endif
 };
 
 static inline struct schedtune *css_st(struct cgroup_subsys_state *css)
@@ -147,6 +153,9 @@ root_schedtune = {
 	.sched_boost_enabled = true,
 	.colocate = false,
 	.colocate_update_disabled = false,
+#endif
+#ifdef OPLUS_FEATURE_POWER_CPUFREQ
+	.window_policy = 3,
 #endif
 	.prefer_idle = 0,
 };
@@ -206,11 +215,6 @@ static inline void init_sched_boost(struct schedtune *st)
 	st->sched_boost_enabled = true;
 	st->colocate = false;
 	st->colocate_update_disabled = false;
-}
-
-bool same_schedtune(struct task_struct *tsk1, struct task_struct *tsk2)
-{
-	return task_schedtune(tsk1) == task_schedtune(tsk2);
 }
 
 void update_cgroup_boost_settings(void)
@@ -537,13 +541,31 @@ static int sched_colocate_write(struct cgroup_subsys_state *css,
 				struct cftype *cft, u64 colocate)
 {
 	struct schedtune *st = css_st(css);
-
+#ifndef OPLUS_FEATURE_POWER_CPUFREQ
+//qiziyu@SH. add schedtune.colocation tuning. 2020.09.30
 	if (st->colocate_update_disabled)
 		return -EPERM;
-
+#endif /* OPLUS_FEATURE_POWER_CPUFREQ */
 	st->colocate = !!colocate;
 	st->colocate_update_disabled = true;
 	return 0;
+}
+
+bool schedtune_task_colocated(struct task_struct *p)
+{
+	struct schedtune *st;
+	bool colocated;
+
+	if (unlikely(!schedtune_initialized))
+		return false;
+
+	/* Get task boost value */
+	rcu_read_lock();
+	st = task_schedtune(p);
+	colocated = st->colocate;
+	rcu_read_unlock();
+
+	return colocated;
 }
 
 #else /* CONFIG_SCHED_WALT */
@@ -605,6 +627,10 @@ int schedtune_cpu_boost(int cpu)
 	return bg->boost_max;
 }
 
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+extern bool test_task_ux(struct task_struct *task);
+#endif /* OPLUS_FEATURE_UIFIRST */
 int schedtune_task_boost(struct task_struct *p)
 {
 	struct schedtune *st;
@@ -617,6 +643,12 @@ int schedtune_task_boost(struct task_struct *p)
 	rcu_read_lock();
 	st = task_schedtune(p);
 	task_boost = st->boost;
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/06/15, Add for UIFirst
+	if (sysctl_uifirst_enabled && sysctl_launcher_boost_enabled && p->static_ux == 2) {
+		task_boost = 60;
+	}
+#endif /* OPLUS_FEATURE_UIFIRST */
 	rcu_read_unlock();
 
 	return task_boost;
@@ -634,6 +666,12 @@ int schedtune_prefer_idle(struct task_struct *p)
 	rcu_read_lock();
 	st = task_schedtune(p);
 	prefer_idle = st->prefer_idle;
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+	if (sysctl_uifirst_enabled && sysctl_launcher_boost_enabled && test_task_ux(p)) {
+		prefer_idle = 1;
+	}
+#endif /* OPLUS_FEATURE_UIFIRST */
 	rcu_read_unlock();
 
 	return prefer_idle;
@@ -704,6 +742,46 @@ boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
 	return 0;
 }
 
+#ifdef OPLUS_FEATURE_POWER_CPUFREQ
+unsigned int schedtune_window_policy(struct task_struct *p)
+{
+	struct schedtune *st;
+	unsigned int window_policy;
+
+	if (unlikely(!schedtune_initialized))
+		return 0;
+
+	rcu_read_lock();
+	st = task_schedtune(p);
+	window_policy = st->window_policy;
+	rcu_read_unlock();
+
+	return window_policy;
+}
+
+static u64
+window_policy_read(struct cgroup_subsys_state *css,
+		struct cftype *cft)
+{
+	struct schedtune *st = css_st(css);
+	return st->window_policy;
+}
+
+static int
+window_policy_write(struct cgroup_subsys_state *css, struct cftype *cft,
+		u64 window_policy)
+{
+	struct schedtune *st = css_st(css);
+
+	if (window_policy >= WINDOW_STATS_INVALID_POLICY)
+		return -EINVAL;
+
+	st->window_policy = window_policy;
+
+	return 0;
+}
+#endif
+
 static struct cftype files[] = {
 #ifdef CONFIG_SCHED_WALT
 	{
@@ -727,6 +805,13 @@ static struct cftype files[] = {
 		.read_u64 = prefer_idle_read,
 		.write_u64 = prefer_idle_write,
 	},
+#ifdef OPLUS_FEATURE_POWER_CPUFREQ
+	{
+		.name = "window_policy",
+		.read_u64 = window_policy_read,
+		.write_u64 = window_policy_write,
+	},
+#endif
 	{ }	/* terminate */
 };
 

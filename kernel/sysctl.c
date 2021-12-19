@@ -72,6 +72,11 @@
 #include <linux/uaccess.h>
 #include <asm/processor.h>
 
+#ifdef OPLUS_FEATURE_TASK_CPUSTATS
+/* Hailong.Liu@TECH.Kernel.CPU, 2019/10/24, stat cpu usage on each tick. */
+#include <linux/task_cpustats.h>
+#endif /* OPLUS_FEATURE_TASK_CPUSTATS */
+
 #ifdef CONFIG_X86
 #include <asm/nmi.h>
 #include <asm/stacktrace.h>
@@ -97,7 +102,16 @@
 #include <linux/nmi.h>
 #endif
 
+#if defined(OPLUS_FEATURE_MULTI_KSWAPD) && defined(CONFIG_OPPO_MULTI_KSWAPD)
+/*Huacai.Zhou@Tech.Kernel.MM, 2020-03-22,add multi kswapd support*/
+#include <linux/oppo_multi_kswapd.h>
+#endif
+
 #if defined(CONFIG_SYSCTL)
+
+#if defined(CONFIG_OPLUS_FEATURE_HUNG_TASK_ENHANCE) && defined(CONFIG_OPLUS_FEATURE_DEATH_HEALER)
+#include <soc/oplus/system/hung_task_enhance.h>
+#endif
 
 /* External variables not in a header file. */
 extern int suid_dumpable;
@@ -133,14 +147,28 @@ static unsigned long zero_ul;
 static unsigned long one_ul = 1;
 static unsigned long long_max = LONG_MAX;
 static int one_hundred = 100;
+#if defined(OPLUS_FEATURE_ZRAM_OPT) && defined(CONFIG_OPPO_ZRAM_OPT)
+/*yixue.ge@PSW.BSP.Kernel.Driver 20170720 add for add direct_vm_swappiness*/
+extern int direct_vm_swappiness;
+static int two_hundred = 200;
+#endif /*OPLUS_FEATURE_ZRAM_OPT*/
+
+#ifdef OPLUS_FEATURE_EDTASK_IMPROVE
+//Tiren.Ma@ANDROID.POWER, 2020-06-24, Add for improving ed task migration
+int sysctl_ed_task_enabled = 1;
+#endif /* OPLUS_FEATURE_EDTASK_IMPROVE */
 static int one_thousand = 1000;
+#if defined(OPLUS_FEATURE_UIFIRST) && defined(CONFIG_OPLUS_FEATURE_UXIO_FIRST)
+/*Huacai.Zhou@BSP.Kernel.IO, 2020-06-12,add ux io first opt*/
+unsigned int sysctl_uxio_io_opt = true;
+bool sysctl_wbt_enable = true;
+#endif /*VENDOR_EDIT*/
 #ifdef CONFIG_PRINTK
 static int ten_thousand = 10000;
 #endif
 #ifdef CONFIG_PERF_EVENTS
 static int six_hundred_forty_kb = 640 * 1024;
 #endif
-static int max_kswapd_threads = MAX_KSWAPD_THREADS;
 static int two_hundred_fifty_five = 255;
 static int __maybe_unused two_hundred_million = 200000000;
 
@@ -324,6 +352,41 @@ static int max_sched_tunable_scaling = SCHED_TUNABLESCALING_END-1;
 #endif /* CONFIG_SMP */
 #endif /* CONFIG_SCHED_DEBUG */
 
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+int sysctl_uifirst_enabled = 1;
+int sysctl_launcher_boost_enabled = 0;
+extern int sysctl_animation_type;
+// Huxiaokai@BSP.KERNEL.POWER, 2020/11/19, Add for non-uifirst task placement
+int sysctl_prefer_silver = 0;
+int sysctl_heavy_task_thresh = 50;
+int sysctl_cpu_util_thresh = 85;
+#endif /* OPLUS_FEATURE_UIFIRST */
+#ifdef OPLUS_FEATURE_UIFIRST
+// Liujie.Xie@TECH.Kernel.Sched, 2020/02/26, add for heavy load task
+int sysctl_cpu_multi_thread = 0;
+#endif
+#ifdef OPLUS_FEATURE_UIFIRST
+// XuHaifeng@BSP.KERNEL.PERFORMANCE, 2020/06/23, Add for UIFirst(sldie boost)
+int sysctl_slide_boost_enabled = 0;
+int sysctl_boost_task_threshold = 51;
+#ifdef CONFIG_CAMERA_OPT
+int sysctl_camera_opt_enabled = 0;
+#endif
+int sysctl_frame_rate = 60;
+int sched_frame_rate_handler(struct ctl_table *table, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	if (write && *ppos)
+		*ppos = 0;
+
+	ret = proc_dointvec(table, write, buffer, lenp, ppos);
+
+	return ret;
+}
+#endif /* OPLUS_FEATURE_UIFIRST */
+
 #ifdef CONFIG_COMPACTION
 static int min_extfrag_threshold;
 static int max_extfrag_threshold = 1000;
@@ -461,6 +524,23 @@ static struct ctl_table kern_table[] = {
 		.extra1         = &one,
 		.extra2         = &one_hundred,
 	},
+#if defined(OPLUS_FEATURE_UIFIRST) && defined(CONFIG_OPLUS_FEATURE_UXIO_FIRST)
+/*Huacai.Zhou@BSP.Kernel.IO, 2020-06-12,add ux io first opt*/
+{
+		.procname	= "uxio_first_opt",
+		.data		= &sysctl_uxio_io_opt,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+},
+{
+		.procname	= "wbt_enable",
+		.data		= &sysctl_wbt_enable,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+},
+#endif
 	{
 		.procname	= "sched_coloc_downmigrate_ns",
 		.data		= &sysctl_sched_coloc_downmigrate_ns,
@@ -562,6 +642,16 @@ static struct ctl_table kern_table[] = {
 		.extra2		= &two,
 	},
 #endif
+#ifdef OPLUS_FEATURE_EDTASK_IMPROVE
+//Tiren.Ma@ANDROID.POWER, 2020-06-24, Add for improving ed task migration
+	{
+		.procname	= "ed_task_enabled",
+		.data		= &sysctl_ed_task_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0666,
+		.proc_handler	= proc_dointvec,
+	},
+#endif /* OPLUS_FEATURE_EDTASK_IMPROVE */
 #ifdef CONFIG_SCHED_DEBUG
 	{
 		.procname       = "sched_cstate_aware",
@@ -1418,7 +1508,25 @@ static struct ctl_table kern_table[] = {
 		.extra1		= &zero,
 		.extra2		= &one,
 	},
-
+#if defined(CONFIG_OPLUS_FEATURE_HUNG_TASK_ENHANCE) && defined(CONFIG_OPLUS_FEATURE_DEATH_HEALER)
+/* record the hung task killing */
+	{
+		.procname	= "hung_task_kill",
+		.data		= &sysctl_hung_task_oppo_kill,
+		.maxlen		= 128,
+		.mode		= 0666,
+		.proc_handler	= proc_dostring,
+	},
+/* Foreground background optimization,change max io count */
+	{
+		.procname	= "hung_task_maxiowait_count",
+		.data		= &sysctl_hung_task_maxiowait_count,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &five,
+	},
+#endif
 #endif
 #ifdef CONFIG_RT_MUTEXES
 	{
@@ -1560,6 +1668,107 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= proc_dointvec,
 	},
 #endif
+#ifdef OPLUS_FEATURE_UIFIRST
+// XieLiujie@BSP.KERNEL.PERFORMANCE, 2020/05/25, Add for UIFirst
+	{
+		.procname	= "uifirst_enabled",
+		.data		= &sysctl_uifirst_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0666,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "launcher_boost_enabled",
+		.data		= &sysctl_launcher_boost_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0666,
+		.proc_handler = proc_dointvec,
+	},
+	// Huxiaokai@BSP.KERNEL.POWER, 2020/11/19, Add for non uifirst task placement
+	{
+		.procname	= "prefer_silver_enabled",
+		.data		= &sysctl_prefer_silver,
+		.maxlen		= sizeof(int),
+		.mode		= 0666,
+		.proc_handler = proc_dointvec,
+	},
+	{
+		.procname	= "heavy_task_thresh",
+		.data		= &sysctl_heavy_task_thresh,
+		.maxlen		= sizeof(int),
+		.mode		= 0666,
+		.proc_handler = proc_dointvec,
+	},
+	{
+		.procname	= "cpu_util_thresh",
+		.data		= &sysctl_cpu_util_thresh,
+		.maxlen		= sizeof(int),
+		.mode		= 0666,
+		.proc_handler = proc_dointvec,
+	},
+	{
+		.procname	= "animation_type",
+		.data		= &sysctl_animation_type,
+		.maxlen		= sizeof(int),
+		.mode		= 0666,
+		.proc_handler = proc_dointvec,
+	},
+#endif /* OPLUS_FEATURE_UIFIRST */
+#ifdef OPLUS_FEATURE_UIFIRST
+	// Liujie.Xie@TECH.Kernel.Sched, 2020/02/26, add for heavy load task
+	{
+		.procname	= "cpu_multi_thread",
+		.data		= &sysctl_cpu_multi_thread,
+		.maxlen 	= sizeof(int),
+		.mode		= 0666,
+		.proc_handler = proc_dointvec,
+	},
+#endif /* OPLUS_FEATURE_UIFIRST */
+#ifdef OPLUS_FEATURE_UIFIRST
+// XuHaifeng@BSP.KERNEL.PERFORMANCE, 2020/06/23, Add for UIFirst(sldie boost)
+	{
+		.procname	= "slide_boost_enabled",
+		.data		= &sysctl_slide_boost_enabled,
+		.maxlen 	= sizeof(int),
+		.mode		= 0666,
+		.proc_handler = proc_dointvec,
+	},
+	{
+		.procname	= "boost_task_threshold",
+		.data		= &sysctl_boost_task_threshold,
+		.maxlen 	= sizeof(int),
+		.mode		= 0666,
+		.proc_handler = proc_dointvec,
+	},
+	{
+		.procname	= "frame_rate",
+		.data		= &sysctl_frame_rate,
+		.maxlen 	= sizeof(int),
+		.mode		= 0666,
+		.proc_handler = sched_frame_rate_handler,
+	},
+#ifdef CONFIG_CAMERA_OPT
+	{
+		.procname       = "camera_opt_enable",
+		.data           = &sysctl_camera_opt_enabled,
+		.maxlen         = sizeof(int),
+		.mode           = 0666,
+		.proc_handler = proc_dointvec,
+	},
+#endif
+#endif /* OPLUS_FEATURE_UIFIRST */
+#ifdef OPLUS_FEATURE_TASK_CPUSTATS
+/* Hailong.Liu@TECH.Kernel.CPU, 2019/10/24, stat cpu usage on each tick. */
+	{
+		.procname	= "task_cpustats_enable",
+		.data		= &sysctl_task_cpustats_enable,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0666,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+#endif /* OPLUS_FEATURE_TASK_CPUSTATS */
 	{ }
 };
 
@@ -1618,7 +1827,7 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= overcommit_kbytes_handler,
 	},
 	{
-		.procname	= "page-cluster", 
+		.procname	= "page-cluster",
 		.data		= &page_cluster,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
@@ -1689,8 +1898,25 @@ static struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &zero,
+#if defined(OPLUS_FEATURE_ZRAM_OPT) && defined(CONFIG_OPPO_ZRAM_OPT)
+/*yixue.ge@PSW.BSP.Kernel.Driver 20170720 add for add direct_vm_swappiness*/
+		.extra2		= &two_hundred,
+#else
 		.extra2		= &one_hundred,
+#endif /*OPLUS_FEATURE_ZRAM_OPT*/
 	},
+#if defined(OPLUS_FEATURE_ZRAM_OPT) && defined(CONFIG_OPPO_ZRAM_OPT)
+/*yixue.ge@PSW.BSP.Kernel.Driver 20170720 add for add direct_vm_swappiness*/
+	{
+		.procname	= "direct_swappiness",
+		.data		= &direct_vm_swappiness,
+		.maxlen 	= sizeof(direct_vm_swappiness),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1 	= &zero,
+		.extra2 	= &two_hundred,
+	},
+#endif
 	{
 		.procname       = "want_old_faultaround_pte",
 		.data           = &want_old_faultaround_pte,
@@ -1762,7 +1988,13 @@ static struct ctl_table vm_table[] = {
 		.procname	= "compact_memory",
 		.data		= &sysctl_compact_memory,
 		.maxlen		= sizeof(int),
+#ifdef VENDOR_EDIT
+/*Huacai.Zhou@PSW.kernel.mm, 2018-08-20, modify permission for coloros.athena*/
+		.mode		= 0222,
+#else
 		.mode		= 0200,
+
+#endif /*VENDOR_EDIT*/
 		.proc_handler	= sysctl_compaction_handler,
 	},
 	{
@@ -1801,6 +2033,8 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= watermark_boost_factor_sysctl_handler,
 		.extra1		= &zero,
 	},
+#if defined(OPLUS_FEATURE_MULTI_KSWAPD) && defined(CONFIG_OPPO_MULTI_KSWAPD)
+/*Huacai.Zhou@Tech.Kernel.MM, 2020-03-22,add multi kswapd support*/
 	{
 		.procname	= "kswapd_threads",
 		.data		= &kswapd_threads,
@@ -1810,6 +2044,7 @@ static struct ctl_table vm_table[] = {
 		.extra1		= &one,
 		.extra2		= &max_kswapd_threads,
 	},
+#endif
 	{
 		.procname	= "watermark_scale_factor",
 		.data		= &watermark_scale_factor,
@@ -2166,7 +2401,7 @@ static struct ctl_table fs_table[] = {
 		.mode		= 0555,
 		.child		= inotify_table,
 	},
-#endif	
+#endif
 #ifdef CONFIG_EPOLL
 	{
 		.procname	= "epoll",
@@ -2611,12 +2846,12 @@ static int __do_proc_dointvec(void *tbl_data, struct ctl_table *table,
 	int *i, vleft, first = 1, err = 0;
 	size_t left;
 	char *kbuf = NULL, *p;
-	
+
 	if (!tbl_data || !table->maxlen || !*lenp || (*ppos && !write)) {
 		*lenp = 0;
 		return 0;
 	}
-	
+
 	i = (int *) tbl_data;
 	vleft = table->maxlen / sizeof(*i);
 	left = *lenp;
@@ -2842,7 +3077,7 @@ static int do_proc_douintvec(struct ctl_table *table, int write,
  * @ppos: file position
  *
  * Reads/writes up to table->maxlen/sizeof(unsigned int) integer
- * values from/to the user buffer, treated as an ASCII string. 
+ * values from/to the user buffer, treated as an ASCII string.
  *
  * Returns 0 on success.
  */
@@ -3357,7 +3592,7 @@ static int do_proc_dointvec_ms_jiffies_conv(bool *negp, unsigned long *lvalp,
  * @ppos: file position
  *
  * Reads/writes up to table->maxlen/sizeof(unsigned int) integer
- * values from/to the user buffer, treated as an ASCII string. 
+ * values from/to the user buffer, treated as an ASCII string.
  * The values read are assumed to be in seconds, and are converted into
  * jiffies.
  *
@@ -3379,8 +3614,8 @@ int proc_dointvec_jiffies(struct ctl_table *table, int write,
  * @ppos: pointer to the file position
  *
  * Reads/writes up to table->maxlen/sizeof(unsigned int) integer
- * values from/to the user buffer, treated as an ASCII string. 
- * The values read are assumed to be in 1/USER_HZ seconds, and 
+ * values from/to the user buffer, treated as an ASCII string.
+ * The values read are assumed to be in 1/USER_HZ seconds, and
  * are converted into jiffies.
  *
  * Returns 0 on success.
@@ -3402,8 +3637,8 @@ int proc_dointvec_userhz_jiffies(struct ctl_table *table, int write,
  * @ppos: the current position in the file
  *
  * Reads/writes up to table->maxlen/sizeof(unsigned int) integer
- * values from/to the user buffer, treated as an ASCII string. 
- * The values read are assumed to be in 1/1000 seconds, and 
+ * values from/to the user buffer, treated as an ASCII string.
+ * The values read are assumed to be in 1/1000 seconds, and
  * are converted into jiffies.
  *
  * Returns 0 on success.
