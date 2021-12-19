@@ -27,6 +27,10 @@
 #include <linux/fscrypt.h>
 #include <linux/fsverity.h>
 
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_IOMONITOR)
+#include <linux/oppo_iomonitor/iomonitor.h>
+#endif
+
 #ifdef CONFIG_F2FS_CHECK_FS
 #define f2fs_bug_on(sbi, condition)	BUG_ON(condition)
 #else
@@ -2984,7 +2988,12 @@ static inline void f2fs_update_iostat(struct f2fs_sb_info *sbi,
 		return;
 	spin_lock(&sbi->iostat_lock);
 	sbi->write_iostat[type] += io_bytes;
-
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_IOMONITOR)
+	if (type == FS_GC_DATA_IO || type == FS_GC_NODE_IO)
+		iomonitor_update_fs_stats(FS_GC_OPT, 1);
+        else if (type == FS_DISCARD)
+		iomonitor_update_fs_stats(FS_DISCARD_OPT, 1);
+#endif
 	if (type == APP_WRITE_IO || type == APP_DIRECT_IO)
 		sbi->write_iostat[APP_BUFFERED_IO] =
 			sbi->write_iostat[APP_WRITE_IO] -
@@ -3971,12 +3980,8 @@ static inline bool f2fs_force_buffered_io(struct inode *inode,
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	int rw = iov_iter_rw(iter);
 
-	if (IS_ENABLED(CONFIG_FS_ENCRYPTION) && f2fs_encrypted_file(inode)) {
-		if (!fscrypt_inode_uses_inline_crypto(inode) ||
-		    !IS_ALIGNED(iocb->ki_pos | iov_iter_alignment(iter),
-				F2FS_BLKSIZE))
-			return true;
-	}
+	if (!fscrypt_dio_supported(iocb, iter))
+		return true;
 	if (fsverity_active(inode))
 		return true;
 	if (f2fs_is_multi_device(sbi))
