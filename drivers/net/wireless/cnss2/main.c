@@ -14,6 +14,17 @@
 #include <soc/qcom/minidump.h>
 #include <soc/qcom/ramdump.h>
 #include <soc/qcom/subsystem_notif.h>
+#ifdef OPLUS_BUG_STABILITY
+//Laixin@CN.PSW.WiFi.Basic.2828376, 2020/02/19
+//Add for: disable wifi while power off charging because modem img will not mount
+#include <soc/oppo/boot_mode.h>
+#endif /* OPLUS_BUG_STABILITY */
+
+#ifdef CONFIG_OPLUS_KEVENT_UPLOAD
+//LiFenfen@CONNECTIVITY.WIFI.HARDWARE.CRASH.1162003, 2020/12/08
+//Add for: pcie self recovery statistics
+#include <linux/oplus_kevent.h>
+#endif /* CONFIG_OPLUS_KEVENT_UPLOAD */
 
 #include "main.h"
 #include "bus.h"
@@ -66,6 +77,45 @@ struct cnss_driver_event {
 	int ret;
 	void *data;
 };
+
+#ifdef CONFIG_OPLUS_KEVENT_UPLOAD
+//LiFenfen@CONNECTIVITY.WIFI.HARDWARE.CRASH.1162003, 2020/12/08
+//Add for: pcie self recovery statistics
+int cnss_stats_self_recovery(void)
+{
+	const char* cnss_event_tag = "wifi_fool_proof";
+	const char* cnss_event_id = "wifi_recovery";
+	const char* cnss_event_payload = "cnss_pcie_self_recovery";
+	struct kernel_packet_info* cnss_event;
+	void *buffer = NULL;
+	int len, size;
+	cnss_pr_err("%s\n", __func__);
+
+	len = strlen(cnss_event_payload);
+	size = sizeof(struct kernel_packet_info) + len + 1;
+
+	buffer = kmalloc(size, GFP_KERNEL);
+	if (!buffer) {
+		cnss_pr_err("%s: Allocation failed\n", __func__);
+		return -ENOMEM;
+	}
+
+	memset(buffer, 0, size);
+	cnss_event = (struct kernel_packet_info *)buffer;
+	cnss_event->type = 1;
+
+	memcpy(cnss_event->log_tag, cnss_event_tag, strlen(cnss_event_tag) + 1);
+	memcpy(cnss_event->event_id, cnss_event_id, strlen(cnss_event_id) + 1);
+
+	cnss_event->payload_length = len + 1;
+	memcpy(cnss_event->payload, cnss_event_payload, cnss_event->payload_length);
+
+	kevent_send_to_user(cnss_event);
+	kfree(buffer);
+
+	return 0;
+}
+#endif /* CONFIG_OPLUS_KEVENT_UPLOAD */
 
 static void cnss_set_plat_priv(struct platform_device *plat_dev,
 			       struct cnss_plat_data *plat_priv)
@@ -1063,8 +1113,20 @@ static int cnss_do_recovery(struct cnss_plat_data *plat_priv,
 	return 0;
 
 self_recovery:
+	cnss_pr_dbg("Going for self recovery\n");
 	cnss_bus_dev_shutdown(plat_priv);
+
+	if (test_bit(LINK_DOWN_SELF_RECOVERY, &plat_priv->ctrl_params.quirks))
+		clear_bit(LINK_DOWN_SELF_RECOVERY,
+			  &plat_priv->ctrl_params.quirks);
+
 	cnss_bus_dev_powerup(plat_priv);
+
+	#ifdef CONFIG_OPLUS_KEVENT_UPLOAD
+	//LiFenfen@CONNECTIVITY.WIFI.HARDWARE.CRASH.1162003, 2020/12/08
+	//Add for: pcie self recovery statistics
+	cnss_stats_self_recovery();
+	#endif /* CONFIG_OPLUS_KEVENT_UPLOAD */
 
 	return 0;
 }
@@ -1169,7 +1231,7 @@ void cnss_schedule_recovery(struct device *dev,
 }
 EXPORT_SYMBOL(cnss_schedule_recovery);
 
-int cnss_force_fw_assert(struct device *dev)
+int cnss_force_fw_assert_async(struct device *dev)
 {
 	struct cnss_plat_data *plat_priv = cnss_bus_dev_to_plat_priv(dev);
 
@@ -1193,7 +1255,44 @@ int cnss_force_fw_assert(struct device *dev)
 		return 0;
 	}
 
-	if (in_interrupt() || irqs_disabled())
+	cnss_pr_info("Force assert (async)\n");
+
+	cnss_driver_event_post(plat_priv,
+			       CNSS_DRIVER_EVENT_FORCE_FW_ASSERT,
+			       0, NULL);
+
+	return 0;
+}
+EXPORT_SYMBOL(cnss_force_fw_assert_async);
+
+int cnss_force_fw_assert(struct device *dev)
+{
+	struct cnss_plat_data *plat_priv = cnss_bus_dev_to_plat_priv(dev);
+	bool post = (in_interrupt() || irqs_disabled());
+
+	if (!plat_priv) {
+		cnss_pr_err("plat_priv is NULL\n");
+		return -ENODEV;
+	}
+
+	if (plat_priv->device_id == QCA6174_DEVICE_ID) {
+		cnss_pr_info("Forced FW assert is not supported\n");
+		return -EOPNOTSUPP;
+	}
+
+	if (cnss_bus_is_device_down(plat_priv)) {
+		cnss_pr_info("Device is already in bad state, ignore force assert\n");
+		return 0;
+	}
+
+	if (test_bit(CNSS_DRIVER_RECOVERY, &plat_priv->driver_state)) {
+		cnss_pr_info("Recovery is already in progress, ignore forced FW assert\n");
+		return 0;
+	}
+
+	cnss_pr_info("Force assert (%s)\n", post ? "async" : "sync");
+
+	if (post)
 		cnss_driver_event_post(plat_priv,
 				       CNSS_DRIVER_EVENT_FORCE_FW_ASSERT,
 				       0, NULL);
@@ -2266,6 +2365,17 @@ static int cnss_probe(struct platform_device *plat_dev)
 	struct cnss_plat_data *plat_priv;
 	const struct of_device_id *of_id;
 	const struct platform_device_id *device_id;
+
+#ifdef OPLUS_BUG_STABILITY
+	//Laixin@CN.PSW.WiFi.Basic.2828376, 2020/02/19
+	//Add for: disable wifi while power off charging because modem img will not mount
+	if (qpnp_is_power_off_charging() &&
+		(get_boot_mode() != MSM_BOOT_MODE__WLAN) &&
+		(get_boot_mode() != MSM_BOOT_MODE__RF)) {
+		cnss_pr_err("charge mode do not load wifi!\n");
+		goto out;
+	}
+#endif /* OPLUS_BUG_STABILITY */
 
 	if (cnss_get_plat_priv(plat_dev)) {
 		cnss_pr_err("Driver is already initialized!\n");

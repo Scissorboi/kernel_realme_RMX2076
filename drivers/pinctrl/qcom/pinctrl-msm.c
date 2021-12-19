@@ -39,10 +39,22 @@
 #include "../pinconf.h"
 #include "pinctrl-msm.h"
 #include "../pinctrl-utils.h"
+#ifdef OPLUS_BUG_STABILITY
+#include <soc/oplus/system/oppo_project.h>
+#endif
 
 #define MAX_NR_GPIO 300
 #define PS_HOLD_OFFSET 0x820
 #define QUP_MASK       GENMASK(5, 0)
+
+#ifdef OPLUS_BUG_STABILITY
+static unsigned int project_number[] = {
+	19191, 19192, 19015, 19016,
+	19591, 19525, 19101, 19501,
+	19125, 19126, 19127, 19128,
+	19521, 19335
+};
+#endif
 
 /**
  * struct msm_pinctrl - state for a pinctrl-msm device
@@ -486,6 +498,21 @@ static int msm_gpio_get(struct gpio_chip *chip, unsigned offset)
 	val = readl(pctrl->regs + g->io_reg);
 	return !!(val & BIT(g->in_bit));
 }
+#ifdef VENDOR_EDIT
+//Fuchun.Liao@PSW.BSP.CHG.Basic, 2016/01/19, add for oppo vooc adapter update
+static int msm_gpio_get_oppo_vooc(struct gpio_chip *chip, unsigned offset)
+{
+	const struct msm_pingroup *g;
+	struct msm_pinctrl *pctrl = gpiochip_get_data(chip);
+	u32 val;
+
+	//pr_err("%s enter\n", __func__);
+	g = &pctrl->soc->groups[offset];
+
+	val = readl_oppo_vooc(pctrl->regs + g->io_reg);
+	return !!(val & BIT(g->in_bit));
+}
+#endif /* VENDOR_EDIT */
 
 static void msm_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
 {
@@ -507,7 +534,29 @@ static void msm_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
 
 	raw_spin_unlock_irqrestore(&pctrl->lock, flags);
 }
+#ifdef VENDOR_EDIT
+//Fuchun.Liao@PSW.BSP.CHG.Basic, 2016/01/19, add for oppo vooc adapter update
+static void msm_gpio_set_oppo_vooc(struct gpio_chip *chip, unsigned offset, int value)
+{
+	const struct msm_pingroup *g;
+	struct msm_pinctrl *pctrl = gpiochip_get_data(chip);
+	u32 val;
 
+	//pr_err("%s enter\n", __func__);
+	g = &pctrl->soc->groups[offset];
+
+	//spin_lock_irqsave(&pctrl->lock, flags);
+
+	val = readl_oppo_vooc(pctrl->regs + g->io_reg);
+	if (value)
+		val |= BIT(g->out_bit);
+	else
+		val &= ~BIT(g->out_bit);
+	writel_oppo_vooc(val, pctrl->regs + g->io_reg);
+
+	//spin_unlock_irqrestore(&pctrl->lock, flags);
+}
+#endif /* VENDOR_EDIT */
 #ifdef CONFIG_DEBUG_FS
 #include <linux/seq_file.h>
 
@@ -527,16 +576,16 @@ static void msm_gpio_dbg_show_one(struct seq_file *s,
 	u32 ctl_reg, io_reg;
 
 	static const char * const pulls_keeper[] = {
-		"no pull",
-		"pull down",
+		"no-pull",
+		"pull-down",
 		"keeper",
-		"pull up"
+		"pull-up"
 	};
 
 	static const char * const pulls_no_keeper[] = {
-		"no pull",
-		"pull down",
-		"pull up",
+		"no-pull",
+		"pull-down",
+		"pull-up",
 	};
 
 	if (!gpiochip_line_is_valid(chip, offset))
@@ -571,8 +620,19 @@ static void msm_gpio_dbg_show(struct seq_file *s, struct gpio_chip *chip)
 	unsigned gpio = chip->base;
 	unsigned i;
 
-	for (i = 0; i < chip->ngpio; i++, gpio++)
+	for (i = 0; i < chip->ngpio; i++, gpio++) {
+		/*xing.xiong@BSP.Kernel.Driver, 2019/10/24, Add for avoid dump when cat d/gpio*/
+		if (i == 28 ||
+			i == 29 ||
+			i == 30 ||
+			i == 31 ||
+			i == 40 ||
+			i == 41 ||
+			i == 42 ||
+			i == 43)
+			continue;
 		msm_gpio_dbg_show_one(s, NULL, chip, i, gpio);
+	}
 }
 
 #else
@@ -584,7 +644,15 @@ static const struct gpio_chip msm_gpio_template = {
 	.direction_output = msm_gpio_direction_output,
 	.get_direction    = msm_gpio_get_direction,
 	.get              = msm_gpio_get,
+#ifdef VENDOR_EDIT
+//Fuchun.Liao@PSW.BSP.CHG.Basic, 2016/01/19, add for oppo vooc adapter update
+	.get_oppo_vooc	  = msm_gpio_get_oppo_vooc,
+#endif /* VENDOR_EDIT */
 	.set              = msm_gpio_set,
+#ifdef VENDOR_EDIT
+//Fuchun.Liao@PSW.BSP.CHG.Basic, 2016/01/19, add for oppo vooc adapter update
+	.set_oppo_vooc	  = msm_gpio_set_oppo_vooc,
+#endif /* VENDOR_EDIT */
 	.request          = gpiochip_generic_request,
 	.free             = gpiochip_generic_free,
 	.dbg_show         = msm_gpio_dbg_show,
@@ -776,6 +844,33 @@ static void msm_gpio_irq_unmask(struct irq_data *d)
 		return;
 
 	_msm_gpio_irq_unmask(d, false);
+}
+
+static void msm_gpio_irq_disable(struct irq_data *d)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct msm_pinctrl *pctrl = gpiochip_get_data(gc);
+	struct irq_data *dir_conn_data;
+	irq_hw_number_t dir_conn_irq = 0;
+
+	if (d->parent_data) {
+		if (is_gpio_dual_edge(d, &dir_conn_irq)) {
+			dir_conn_data = irq_get_irq_data(dir_conn_irq);
+			if (!dir_conn_data)
+				return;
+
+			if (dir_conn_data->chip->irq_disable)
+				dir_conn_data->chip->irq_disable(dir_conn_data);
+			else
+				dir_conn_data->chip->irq_mask(dir_conn_data);
+		}
+		irq_chip_disable_parent(d);
+	}
+
+	if (test_bit(d->hwirq, pctrl->wakeup_masked_irqs))
+		return;
+
+	_msm_gpio_irq_mask(d);
 }
 
 static void msm_gpio_irq_enable(struct irq_data *d)
@@ -1315,6 +1410,7 @@ static int msm_gpio_init(struct msm_pinctrl *pctrl)
 	pctrl->irq_chip.name = "msmgpio";
 	pctrl->irq_chip.irq_eoi	= irq_chip_eoi_parent;
 	pctrl->irq_chip.irq_enable = msm_gpio_irq_enable;
+	pctrl->irq_chip.irq_disable = msm_gpio_irq_disable;
 	pctrl->irq_chip.irq_mask = msm_gpio_irq_mask;
 	pctrl->irq_chip.irq_unmask = msm_gpio_irq_unmask;
 	pctrl->irq_chip.irq_ack = msm_gpio_irq_ack;
@@ -1526,6 +1622,22 @@ int msm_gpio_mpm_wake_set(unsigned int gpio, bool enable)
 }
 EXPORT_SYMBOL(msm_gpio_mpm_wake_set);
 
+#ifdef OPLUS_BUG_STABILITY
+static void msm_pinctrl_wakeup_set(void)
+{
+	int i;
+	unsigned int project = get_project();
+
+	for(i = 0; i< sizeof(project_number); i++){
+		if(project == project_number[i]){
+			pr_err("Disable GPIO105 wakeup\n");
+			msm_gpio_mpm_wake_set(105, false);
+			break;
+		}
+	}
+}
+#endif
+
 int msm_pinctrl_probe(struct platform_device *pdev,
 		      const struct msm_pinctrl_soc_data *soc_data)
 {
@@ -1592,6 +1704,9 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 
 	register_syscore_ops(&msm_pinctrl_pm_ops);
 	dev_dbg(&pdev->dev, "Probed Qualcomm pinctrl driver\n");
+#ifdef OPLUS_BUG_STABILITY
+	msm_pinctrl_wakeup_set();
+#endif
 
 	return 0;
 }
